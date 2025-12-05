@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Trò Chơi Hộp Hộp 3D (Cánh tay hướng ra ngoài / Ragdoll)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117;
+        }
+        canvas { display: block; cursor: grab; }
+        canvas:active { cursor: grabbing; }
+    </style>
+</head>
+<body class="flex items-center justify-center h-screen">
+    <div class="absolute top-4 left-4 p-4 bg-gray-800 bg-opacity-70 rounded-lg shadow-xl text-white z-10 w-64 md:w-80">
+        <h1 class="text-xl font-bold mb-2 text-cyan-400">Điều Khiển Trò Chơi</h1>
+        <hr class="my-2 border-gray-600">
+        <p class="text-sm mb-1 font-bold text-yellow-300">Giữ Chuột Trái & Kéo</p>
+        <p class="text-xs mb-3 text-gray-300">Cánh tay phản ứng theo <strong>hướng nhìn của cơ thể</strong>.</p>
+        <p class="text-sm mb-1"><span class="font-semibold text-yellow-300">W</span>: Di chuyển Tiến</p>
+        <p class="text-sm mb-1"><span class="font-semibold text-yellow-300">S</span>: Di chuyển Lùi</p>
+        <p class="text-sm mb-1"><span class="font-semibold text-yellow-300">A</span>: Di chuyển Sang Trái</p>
+        <p class="text-sm mb-1"><span class="font-semibold text-yellow-300">D</span>: Di chuyển Sang Phải</p>
+        <p class="text-sm mb-1 font-bold text-pink-400"><span class="font-semibold text-pink-400">Spacebar</span>: Nhảy</p>
+        <p class="text-sm mb-1 font-bold text-green-300">R: Bật/Tắt Ragdoll</p>
+        <p class="text-sm mt-3 pt-2 text-gray-400">Trạng thái: <strong>Upper arm hướng ra ngoài; forearm+hand dịch ra ngoài cùng; R để ragdoll</strong></p>
+    </div>
+
+    <script type="module">
+        // ---------- Globals ----------
+        let scene, camera, renderer, cube, platform, pillar;
+        let lowerBodyGroup, middleBodyGroup, upperBodyGroup;
+        let headMesh;
+
+        // Arm variables (groups and joints)
+        let armLeftGroup, armRightGroup, forearmLeftJoint, forearmRightJoint;
+
+        let keys = {};
+        const cubeSpeed = 0.1;
+
+        // Ragdoll
+        let ragdollEnabled = false;
+        let forearmVelLeft = 0;
+        let forearmVelRight = 0;
+        const RAGDOLL_GRAVITY_TORQUE = 0.02;
+        const RAGDOLL_DAMPING = 0.98;
+
+        // Camera control
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+        const spherical = new THREE.Spherical(15, Math.PI / 3, -Math.PI / 4);
+        const MIN_CAMERA_WORLD_Y = 0.2;
+        const MIN_ACTUAL_RADIUS = 1.0;
+
+        // Physics
+        let verticalVelocity = 0;
+        const gravity = 0.03;
+        const jumpStrength = 0.3;
+
+        // Body sizes
+        const BODY_WIDTH = 0.8;
+        const BODY_DEPTH = 0.6;
+        const BODY_HEIGHT = 1.5;
+        const SEGMENT_HEIGHT = BODY_HEIGHT / 3;
+        const LEG_HEIGHT = 1.25;
+        const FOOT_HEIGHT = 0.1;
+
+        // Head/neck
+        const HEAD_SIZE = 0.5;
+        const NECK_HEIGHT = 0.2;
+        const NECK_WIDTH = 0.3;
+
+        // Arm constants
+        const ARM_LENGTH = 0.7;
+        const ARM_WIDTH = 0.2;
+        const ARM_DEPTH = 0.2;
+        const FOREARM_LENGTH = 0.8;
+        const HAND_LENGTH = 0.2;
+        const ARM_X_POSITION = (BODY_WIDTH / 2) + (ARM_WIDTH / 2) + 0.02; // gần thân hơn
+
+        const playerHeight = BODY_HEIGHT + LEG_HEIGHT + FOOT_HEIGHT;
+        const playerCenterY = playerHeight / 2;
+
+        // Pivots
+        const HIP_JOINT_Y = playerCenterY - (BODY_HEIGHT / 2);
+        const SHOULDER_JOINT_Y = SEGMENT_HEIGHT - (SEGMENT_HEIGHT / 4);
+
+        // Landing
+        const LANDING_DURATION = 20;
+        const MAX_SQUAT_ANGLE = Math.PI / 8;
+        let landingTimer = 0;
+        let jumpRequestedDuringLanding = false;
+
+        // Smoothing
+        const IDLE_LERP_FACTOR = 0.2;
+
+        // Look limits
+        const MAX_LOOK_AT_PITCH = Math.PI / 8;
+        const MAX_LOOK_AT_YAW = Math.PI / 6;
+
+        // Walk anim
+        let legLeft, legRight, calfLeft, calfRight, footLeft, footRight;
+        let animationTime = 0;
+        const walkSpeed = cubeSpeed * 2;
+        const maxLegSwing = Math.PI / 6;
+        const maxFootLift = Math.PI / 10;
+        const maxArmSwing = 55 * (Math.PI / 180);
+
+        let collidableObjects = [];
+
+        // Materials
+        const bodyMaterial = new THREE.MeshLambertMaterial({ transparent: true, opacity: 1.0 });
+        const bodyGeometry = new THREE.BoxGeometry(BODY_WIDTH, SEGMENT_HEIGHT, BODY_DEPTH);
+        const legMaterial = new THREE.MeshLambertMaterial({ color: 0x888888, transparent: true, opacity: 1.0 });
+        const armMaterial = new THREE.MeshLambertMaterial({ color: 0x999999, transparent: true, opacity: 1.0 });
+
+        // ---------- Arm creation ----------
+        // Upper arm has a static outward rotation (shoulderPivot.rotation.z)
+        // Elbow group is offset in X so forearm+hand move outward together
+        function createArm(side) {
+            const upperArmHeight = ARM_LENGTH;
+            const forearmHeight = FOREARM_LENGTH;
+            const handHeight = HAND_LENGTH;
+
+            const upperArmGeometry = new THREE.BoxGeometry(ARM_WIDTH, upperArmHeight, ARM_DEPTH);
+            const forearmGeometry = new THREE.BoxGeometry(ARM_WIDTH, forearmHeight, ARM_DEPTH);
+            const handGeometry = new THREE.BoxGeometry(ARM_WIDTH * 1.5, handHeight, ARM_DEPTH * 1.5);
+
+            const armGroup = new THREE.Group();
+            armGroup.name = `ArmGroup${side}`;
+            armGroup.position.x = side === 'Left' ? -ARM_X_POSITION : ARM_X_POSITION;
+            armGroup.position.y = SHOULDER_JOINT_Y;
+
+            // Shoulder pivot with static outward rotation
+            const shoulderPivot = new THREE.Group();
+            shoulderPivot.name = `ShoulderPivot${side}`;
+            shoulderPivot.position.y = 0;
+            const outwardAngle = 0.18; // ~10 degrees outward; tweakable
+            shoulderPivot.rotation.z = side === 'Left' ? outwardAngle : -outwardAngle;
+            armGroup.add(shoulderPivot);
+
+            // Upper arm mesh (top aligned to pivot)
+            const upperArmMesh = new THREE.Mesh(upperArmGeometry, armMaterial.clone());
+            upperArmMesh.name = `UpperArmMesh${side}`;
+            upperArmMesh.position.y = -upperArmHeight / 2;
+            upperArmMesh.position.x = side === 'Left' ? ARM_WIDTH * 0.25 : -ARM_WIDTH * 0.25;
+            shoulderPivot.add(upperArmMesh);
+
+            // Elbow group attached to shoulderPivot; offset X so forearm+hand are outside torso
+            const elbowGroup = new THREE.Group();
+            elbowGroup.name = `ElbowJoint${side}`;
+            elbowGroup.position.y = -upperArmHeight;
+            const elbowOutwardOffset = 0.12; // moves forearm+hand outward together
+            elbowGroup.position.x = side === 'Left' ? -elbowOutwardOffset : elbowOutwardOffset;
+            shoulderPivot.add(elbowGroup);
+
+            // Forearm mesh
+            const forearmMesh = new THREE.Mesh(forearmGeometry, armMaterial.clone());
+            forearmMesh.name = `ForearmMesh${side}`;
+            forearmMesh.position.y = -forearmHeight / 2;
+            elbowGroup.add(forearmMesh);
+
+            // Wrist and hand
+            const wristGroup = new THREE.Group();
+            wristGroup.name = `WristJoint${side}`;
+            wristGroup.position.y = -forearmHeight;
+            elbowGroup.add(wristGroup);
+
+            const handMesh = new THREE.Mesh(handGeometry, armMaterial.clone());
+            handMesh.name = `HandMesh${side}`;
+            handMesh.position.y = -handHeight / 2;
+            wristGroup.add(handMesh);
+
+            return {
+                arm: armGroup,
+                shoulder: shoulderPivot,
+                elbow: elbowGroup,
+                wrist: wristGroup
+            };
+        }
+
+        // ---------- Init ----------
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Mouse events
+            renderer.domElement.addEventListener('mousedown', onMouseDown, false);
+            renderer.domElement.addEventListener('mousemove', onMouseMove, false);
+            renderer.domElement.addEventListener('mouseup', onMouseUp, false);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 10, 7.5);
+            scene.add(directionalLight);
+
+            // Platform
+            const platformGeometry = new THREE.PlaneGeometry(30, 30);
+            const platformMaterial = new THREE.MeshLambertMaterial({ color: 0x283845, side: THREE.DoubleSide });
+            platform = new THREE.Mesh(platformGeometry, platformMaterial);
+            platform.rotation.x = Math.PI / 2;
+            platform.position.y = -0.5;
+            scene.add(platform);
+
+            const gridHelper = new THREE.GridHelper(30, 30, 0x555555, 0x555555);
+            gridHelper.position.y = -0.49;
+            scene.add(gridHelper);
+
+            // Character group
+            cube = new THREE.Group();
+
+            // Lower body
+            lowerBodyGroup = new THREE.Group();
+            lowerBodyGroup.name = "LowerBodyJoint";
+            lowerBodyGroup.position.y = HIP_JOINT_Y;
+            cube.add(lowerBodyGroup);
+
+            const lowerBodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial.clone());
+            lowerBodyMesh.material.color.set(0xff5555);
+            lowerBodyMesh.name = "LowerBodyMesh";
+            lowerBodyMesh.position.y = SEGMENT_HEIGHT / 2;
+            lowerBodyGroup.add(lowerBodyMesh);
+
+            // Middle body
+            middleBodyGroup = new THREE.Group();
+            middleBodyGroup.name = "MiddleBodyJoint";
+            middleBodyGroup.position.y = SEGMENT_HEIGHT;
+            lowerBodyGroup.add(middleBodyGroup);
+
+            const middleBodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial.clone());
+            middleBodyMesh.material.color.set(0x55ff55);
+            middleBodyMesh.name = "MiddleBodyMesh";
+            middleBodyMesh.position.y = SEGMENT_HEIGHT / 2;
+            middleBodyGroup.add(middleBodyMesh);
+
+            // Upper body
+            upperBodyGroup = new THREE.Group();
+            upperBodyGroup.name = "UpperBodyJoint";
+            upperBodyGroup.position.y = SEGMENT_HEIGHT;
+            middleBodyGroup.add(upperBodyGroup);
+
+            const upperBodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial.clone());
+            upperBodyMesh.material.color.set(0x5555ff);
+            upperBodyMesh.name = "UpperBodyMesh";
+            upperBodyMesh.position.y = SEGMENT_HEIGHT / 2;
+            upperBodyGroup.add(upperBodyMesh);
+
+            // Neck & head
+            const neckGeometry = new THREE.CylinderGeometry(NECK_WIDTH / 2, NECK_WIDTH / 2, NECK_HEIGHT, 12);
+            const neckMaterial = new THREE.MeshLambertMaterial({ color: 0xcccccc, transparent: true, opacity: 1.0 });
+            const neckMesh = new THREE.Mesh(neckGeometry, neckMaterial);
+            neckMesh.name = "NeckMesh";
+            neckMesh.position.y = SEGMENT_HEIGHT + (NECK_HEIGHT / 2);
+            upperBodyGroup.add(neckMesh);
+
+            const headGeometry = new THREE.BoxGeometry(HEAD_SIZE, HEAD_SIZE, HEAD_SIZE);
+            const headMaterial = new THREE.MeshLambertMaterial({ color: 0xffa500, transparent: true, opacity: 1.0 });
+            headMesh = new THREE.Mesh(headGeometry, headMaterial);
+            headMesh.name = "HeadMesh";
+            headMesh.position.y = SEGMENT_HEIGHT + NECK_HEIGHT + (HEAD_SIZE / 2);
+            upperBodyGroup.add(headMesh);
+
+            // Arms
+            const leftArmParts = createArm('Left');
+            armLeftGroup = leftArmParts.arm;
+            forearmLeftJoint = leftArmParts.elbow;
+            upperBodyGroup.add(armLeftGroup);
+
+            const rightArmParts = createArm('Right');
+            armRightGroup = rightArmParts.arm;
+            forearmRightJoint = rightArmParts.elbow;
+            upperBodyGroup.add(armRightGroup);
+
+            // Legs
+            const thighHeight = LEG_HEIGHT / 2;
+            const calfHeight = LEG_HEIGHT / 2;
+            const legWidth = 0.25;
+            const legDepth = 0.25;
+            const footWidth = legWidth * 1.5;
+            const footDepth = 0.5;
+            const thighGeometry = new THREE.BoxGeometry(legWidth, thighHeight, legDepth);
+            const calfGeometry = new THREE.BoxGeometry(legWidth, calfHeight, legDepth);
+            const footGeometry = new THREE.BoxGeometry(footWidth, FOOT_HEIGHT, footDepth);
+            const legXPosition = 0.18;
+
+            function createLeg(side) {
+                const legGroup = new THREE.Group();
+                legGroup.name = `Leg${side}`;
+                legGroup.position.x = side === 'Left' ? -legXPosition : legXPosition;
+                legGroup.position.y = 0;
+
+                const thighMesh = new THREE.Mesh(thighGeometry, legMaterial);
+                thighMesh.name = `ThighMesh${side}`;
+                thighMesh.position.y = -thighHeight / 2;
+                legGroup.add(thighMesh);
+
+                const kneeGroup = new THREE.Group();
+                kneeGroup.name = `KneeJoint${side}`;
+                kneeGroup.position.y = -thighHeight;
+                legGroup.add(kneeGroup);
+
+                const calfMesh = new THREE.Mesh(calfGeometry, legMaterial.clone());
+                calfMesh.name = `CalfMesh${side}`;
+                calfMesh.position.y = -calfHeight / 2;
+                kneeGroup.add(calfMesh);
+
+                const ankleGroup = new THREE.Group();
+                ankleGroup.name = `AnkleJoint${side}`;
+                ankleGroup.position.y = -calfHeight;
+                kneeGroup.add(ankleGroup);
+
+                const footMesh = new THREE.Mesh(footGeometry, legMaterial.clone());
+                footMesh.name = `FootMesh${side}`;
+                footMesh.position.y = -FOOT_HEIGHT / 2;
+                footMesh.position.z = footDepth / 4;
+                ankleGroup.add(footMesh);
+
+                return {
+                    leg: legGroup,
+                    knee: kneeGroup,
+                    ankle: ankleGroup
+                };
+            }
+
+            const leftLegParts = createLeg('Left');
+            legLeft = leftLegParts.leg;
+            calfLeft = leftLegParts.knee;
+            footLeft = leftLegParts.ankle;
+            legLeft.position.y = HIP_JOINT_Y;
+            cube.add(legLeft);
+
+            const rightLegParts = createLeg('Right');
+            legRight = rightLegParts.leg;
+            calfRight = rightLegParts.knee;
+            footRight = rightLegParts.ankle;
+            legRight.position.y = HIP_JOINT_Y;
+            cube.add(legRight);
+
+            // Finalize character
+            cube.position.y = playerCenterY;
+            scene.add(cube);
+
+            // Pillar obstacle
+            const pillarGeometry = new THREE.CylinderGeometry(1, 1, 6, 32);
+            const pillarMaterial = new THREE.MeshLambertMaterial({ color: 0x607d8b });
+            pillar = new THREE.Mesh(pillarGeometry, pillarMaterial);
+            pillar.position.set(5, 3, 5);
+            scene.add(pillar);
+
+            collidableObjects.push(pillar);
+            collidableObjects.push(platform);
+
+            // Camera initial radius
+            spherical.radius = 8;
+            updateCameraPosition();
+        }
+
+        // ---------- Mouse handlers ----------
+        function onMouseDown(event) {
+            isDragging = true;
+            previousMousePosition.x = event.clientX;
+            previousMousePosition.y = event.clientY;
+            renderer.domElement.style.cursor = 'grabbing';
+        }
+
+        function onMouseMove(event) {
+            if (!isDragging) return;
+            const deltaX = event.clientX - previousMousePosition.x;
+            const deltaY = event.clientY - previousMousePosition.y;
+            spherical.theta -= deltaX * 0.005;
+            spherical.phi -= deltaY * 0.005;
+            spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.01, spherical.phi));
+            previousMousePosition.x = event.clientX;
+            previousMousePosition.y = event.clientY;
+        }
+
+        function onMouseUp() {
+            isDragging = false;
+            renderer.domElement.style.cursor = 'grab';
+        }
+
+        // ---------- Camera update ----------
+        function updateCameraPosition() {
+            const focusPoint = cube.position.clone();
+            focusPoint.y += SEGMENT_HEIGHT + NECK_HEIGHT + HEAD_SIZE / 2;
+
+            let actualRadius = spherical.radius;
+            const projectedRelativeY = spherical.radius * Math.cos(spherical.phi);
+            const projectedWorldY = focusPoint.y + projectedRelativeY;
+
+            if (projectedWorldY < MIN_CAMERA_WORLD_Y) {
+                const requiredRelativeY = MIN_CAMERA_WORLD_Y - focusPoint.y;
+                if (Math.abs(Math.cos(spherical.phi)) > 0.001) {
+                    let newRadius = requiredRelativeY / Math.cos(spherical.phi);
+                    actualRadius = Math.max(MIN_ACTUAL_RADIUS, Math.min(spherical.radius, newRadius));
+                }
+            } else {
+                actualRadius = spherical.radius;
+            }
+
+            const position = new THREE.Vector3().setFromSphericalCoords(actualRadius, spherical.phi, spherical.theta);
+            position.add(focusPoint);
+            camera.position.copy(position);
+            camera.lookAt(focusPoint);
+
+            // Fade character when camera is close
+            const fadeStartDistance = 5.0;
+            const fadeEndDistance = 2.0;
+            let opacity = (actualRadius - fadeEndDistance) / (fadeStartDistance - fadeEndDistance);
+            opacity = THREE.MathUtils.clamp(opacity, 0.0, 1.0);
+
+            cube.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => { m.opacity = opacity; m.needsUpdate = true; });
+                    } else {
+                        child.material.opacity = opacity;
+                        child.material.needsUpdate = true;
+                    }
+                }
+            });
+        }
+
+        // ---------- Spine look-at ----------
+        function updateSpineLookAt() {
+            const cameraDirection = new THREE.Vector3();
+            camera.getWorldDirection(cameraDirection);
+
+            const relativeYaw = Math.atan2(cameraDirection.x, cameraDirection.z);
+            const horizontalLookDistance = Math.sqrt(cameraDirection.x * cameraDirection.x + cameraDirection.z * cameraDirection.z);
+            let cameraLookPitch = Math.atan2(cameraDirection.y, horizontalLookDistance);
+
+            const clampedYaw = THREE.MathUtils.clamp(relativeYaw, -MAX_LOOK_AT_YAW, MAX_LOOK_AT_YAW);
+            cameraLookPitch = THREE.MathUtils.clamp(cameraLookPitch, -MAX_LOOK_AT_PITCH, MAX_LOOK_AT_PITCH);
+
+            const lerpFactor = 0.15;
+            const spinePitch = -cameraLookPitch;
+            const spineYaw = clampedYaw;
+
+            lowerBodyGroup.rotation.y = THREE.MathUtils.lerp(lowerBodyGroup.rotation.y, spineYaw * 0.3, lerpFactor);
+            lowerBodyGroup.rotation.x = THREE.MathUtils.lerp(lowerBodyGroup.rotation.x, spinePitch * 0.2, lerpFactor);
+
+            middleBodyGroup.rotation.y = THREE.MathUtils.lerp(middleBodyGroup.rotation.y, spineYaw * 0.3, lerpFactor);
+            middleBodyGroup.rotation.x = THREE.MathUtils.lerp(middleBodyGroup.rotation.x, spinePitch * 0.3, lerpFactor);
+
+            upperBodyGroup.rotation.y = THREE.MathUtils.lerp(upperBodyGroup.rotation.y, spineYaw * 0.4, lerpFactor);
+            upperBodyGroup.rotation.x = THREE.MathUtils.lerp(upperBodyGroup.rotation.x, spinePitch * 0.5, lerpFactor);
+
+            if (headMesh) {
+                const neededYaw = spineYaw - upperBodyGroup.rotation.y;
+                const neededPitch = spinePitch - upperBodyGroup.rotation.x;
+                headMesh.rotation.y = THREE.MathUtils.lerp(headMesh.rotation.y, neededYaw, lerpFactor * 2.5);
+                headMesh.rotation.x = THREE.MathUtils.lerp(headMesh.rotation.x, neededPitch, lerpFactor * 2.5);
+            }
+        }
+
+        // ---------- Arms update (with ragdoll option) ----------
+        function updateArmLookAt(isMoving, isAirborne) {
+            const bodyPitch = upperBodyGroup.rotation.x;
+            const targetShoulderPitch = bodyPitch * 1.5;
+            const targetElbowBend = -(Math.abs(bodyPitch) * 0.5 + 0.1);
+            const swing = isMoving ? Math.sin(animationTime) * maxArmSwing : 0;
+
+            if (ragdollEnabled) {
+                // Simple angular velocity ragdoll on forearms
+                forearmVelLeft += RAGDOLL_GRAVITY_TORQUE;
+                forearmVelLeft *= RAGDOLL_DAMPING;
+                forearmLeftJoint.rotation.x += forearmVelLeft;
+
+                forearmVelRight += RAGDOLL_GRAVITY_TORQUE;
+                forearmVelRight *= RAGDOLL_DAMPING;
+                forearmRightJoint.rotation.x += forearmVelRight;
+
+                // Keep upper arm pose natural (lerp)
+                const targetRightX = -swing + targetShoulderPitch;
+                const targetLeftX = swing + targetShoulderPitch;
+                armRightGroup.rotation.x = THREE.MathUtils.lerp(armRightGroup.rotation.x, targetRightX, IDLE_LERP_FACTOR);
+                armLeftGroup.rotation.x = THREE.MathUtils.lerp(armLeftGroup.rotation.x, targetLeftX, IDLE_LERP_FACTOR);
+            } else {
+                if (isAirborne) {
+                    const raisePitch = -Math.PI / 3;
+                    const raiseElbow = -Math.PI / 6;
+                    armRightGroup.rotation.x = THREE.MathUtils.lerp(armRightGroup.rotation.x, raisePitch, 0.25);
+                    forearmRightJoint.rotation.x = THREE.MathUtils.lerp(forearmRightJoint.rotation.x, raiseElbow, 0.25);
+                    armLeftGroup.rotation.x = THREE.MathUtils.lerp(armLeftGroup.rotation.x, raisePitch, 0.25);
+                    forearmLeftJoint.rotation.x = THREE.MathUtils.lerp(forearmLeftJoint.rotation.x, raiseElbow, 0.25);
+                } else {
+                    const targetRightX = -swing + targetShoulderPitch;
+                    const targetLeftX = swing + targetShoulderPitch;
+                    armRightGroup.rotation.x = THREE.MathUtils.lerp(armRightGroup.rotation.x, targetRightX, IDLE_LERP_FACTOR);
+                    forearmRightJoint.rotation.x = THREE.MathUtils.lerp(forearmRightJoint.rotation.x, targetElbowBend, IDLE_LERP_FACTOR);
+                    armLeftGroup.rotation.x = THREE.MathUtils.lerp(armLeftGroup.rotation.x, targetLeftX, IDLE_LERP_FACTOR);
+                    forearmLeftJoint.rotation.x = THREE.MathUtils.lerp(forearmLeftJoint.rotation.x, targetElbowBend, IDLE_LERP_FACTOR);
+                }
+            }
+        }
+
+        // ---------- Input & physics ----------
+        function handleInput() {
+            const moveVector = new THREE.Vector3(0, 0, 0);
+
+            const forward = new THREE.Vector3();
+            camera.getWorldDirection(forward);
+            forward.y = 0;
+            forward.normalize();
+
+            const right = new THREE.Vector3();
+            right.crossVectors(forward, new THREE.Vector3(0, 1, 0));
+
+            if (landingTimer === 0) {
+                let movementHappened = false;
+                if (keys['w']) { moveVector.add(forward); movementHappened = true; }
+                if (keys['s']) { moveVector.sub(forward); movementHappened = true; }
+                if (keys['a']) { moveVector.sub(right); movementHappened = true; }
+                if (keys['d']) { moveVector.add(right); movementHappened = true; }
+                if (movementHappened) {
+                    moveVector.normalize().multiplyScalar(cubeSpeed);
+                    cube.position.add(moveVector);
+                }
+            }
+
+            const isMoving = moveVector.lengthSq() > 0.0001;
+            cube.rotation.y = 0;
+
+            // Jump queue
+            const isJumpInput = keys.Space;
+            const wasAirborne = cube.position.y > playerCenterY + 0.01;
+            if (isJumpInput && landingTimer > 0) jumpRequestedDuringLanding = true;
+            if ((isJumpInput || jumpRequestedDuringLanding) && landingTimer === 0 && !wasAirborne) {
+                verticalVelocity = jumpStrength;
+                jumpRequestedDuringLanding = false;
+                animationTime = 0;
+            }
+
+            if (wasAirborne || verticalVelocity !== 0) {
+                verticalVelocity -= gravity;
+                cube.position.y += verticalVelocity;
+            }
+
+            if (cube.position.y <= playerCenterY) {
+                if (wasAirborne) {
+                    landingTimer = LANDING_DURATION;
+                    verticalVelocity = 0;
+                }
+                cube.position.y = playerCenterY;
+            }
+
+            const isCurrentlyAirborne = cube.position.y > playerCenterY + 0.01;
+
+            // Animation logic
+            if (landingTimer > 0) {
+                const t = landingTimer / LANDING_DURATION;
+                const progress = 1.0 - t;
+                const squatFactor = progress * (1 - progress) * 4;
+                const squatAngle = squatFactor * MAX_SQUAT_ANGLE;
+                legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, -squatAngle * 0.2, 0.3);
+                legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, -squatAngle * 0.2, 0.3);
+                calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, squatAngle * 1.8, 0.3);
+                calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, squatAngle * 1.8, 0.3);
+                landingTimer = Math.max(0, landingTimer - 1);
+            } else {
+                if (isMoving && !isCurrentlyAirborne) {
+                    animationTime += walkSpeed;
+                    const legSwing = Math.sin(animationTime) * maxLegSwing;
+                    legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, legSwing, IDLE_LERP_FACTOR);
+                    legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, -legSwing, IDLE_LERP_FACTOR);
+                    calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, Math.abs(legSwing) * 0.8, IDLE_LERP_FACTOR);
+                    calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, Math.abs(legSwing) * 0.8, IDLE_LERP_FACTOR);
+                    footLeft.rotation.x = THREE.MathUtils.lerp(footLeft.rotation.x, Math.sin(animationTime) * maxFootLift, IDLE_LERP_FACTOR);
+                    footRight.rotation.x = THREE.MathUtils.lerp(footRight.rotation.x, -Math.sin(animationTime) * maxFootLift, IDLE_LERP_FACTOR);
+                } else {
+                    animationTime += 0.02;
+                    legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                    calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                    footLeft.rotation.x = THREE.MathUtils.lerp(footLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    footRight.rotation.x = THREE.MathUtils.lerp(footRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                }
+            }
+
+            // Update spine and arms
+            updateSpineLookAt();
+            updateArmLookAt(isMoving, isCurrentlyAirborne);
+        }
+
+        // ---------- Animation loop ----------
+        function animate() {
+            requestAnimationFrame(animate);
+            handleInput();
+            updateCameraPosition();
+            renderer.render(scene, camera);
+        }
+
+        // ---------- Keyboard handlers ----------
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'w' || key === 'a' || key === 's' || key === 'd') keys[key] = true;
+            if (e.code === 'Space') keys.Space = true;
+            if (key === 'r') {
+                ragdollEnabled = !ragdollEnabled;
+                if (ragdollEnabled) { forearmVelLeft = 0; forearmVelRight = 0; }
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'w' || key === 'a' || key === 's' || key === 'd') keys[key] = false;
+            if (e.code === 'Space') keys.Space = false;
+        });
+
+        // ---------- Resize ----------
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ---------- Start ----------
+        init();
+        animate();
+    </script>
+</body>
+</html>
