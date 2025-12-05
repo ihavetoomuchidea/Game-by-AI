@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Game by AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117;
+        }
+        canvas { display: block; cursor: grab; }
+        canvas:active { cursor: grabbing; }
+    </style>
+</head>
+<body class="flex items-center justify-center h-screen">
+    <div class="absolute top-4 left-4 p-4 bg-gray-800 bg-opacity-70 rounded-lg shadow-xl text-white z-10 w-64 md:w-80">
+        <h1 class="text-xl font-bold mb-2 text-cyan-400">Điều Khiển Trò Chơi</h1>
+        <hr class="my-2 border-gray-600">
+        <p class="text-sm mb-1 font-bold text-yellow-300">Giữ Chuột Trái & Kéo</p>
+        <p class="text-xs mb-3 text-gray-300">Cánh tay phản ứng theo <strong>hướng nhìn của cơ thể</strong>.</p>
+        <p class="text-sm mb-1"><span class="font-semibold text-yellow-300">W/S/A/D</span>: Di chuyển</p>
+        <p class="text-sm mb-1 font-bold text-pink-400">
+            <span class="font-semibold text-pink-400">Spacebar</span>: Nhảy Base (Tap khi di chuyển) / Tụ lực (Giữ)
+            (<span id="jump-charge-text">0.0s</span>)
+        </p>
+        <p class="text-xs mb-1 text-gray-300 ml-4">
+            - Charge Stand: Max 1.6x, **Max 0.9s**, bị chặn di chuyển, **CÓ** animation squat + **TAY NẠP LỰC**.
+        </p>
+        <p class="text-xs mb-1 text-gray-300 ml-4">
+            - Charge Move: Max 1.4x, **Max 0.8s**, vẫn di chuyển, KHÔNG animation squat.
+        </p>
+        <p class="text-sm mb-1 font-bold text-green-300 mt-2">R: Bật/Tắt Ragdoll</p>
+        <p class="text-sm mt-3 pt-2 text-gray-400" id="status-message">Trạng thái: <strong>Sẵn sàng.</strong></p>
+    </div>
+    <!-- New UI for charge bar -->
+    <div id="charge-bar-container" class="absolute bottom-4 left-1/2 transform -translate-x-1/2 w-48 h-2 bg-gray-700 rounded-full overflow-hidden transition-opacity duration-300 opacity-0 z-10">
+        <div id="charge-bar" class="h-full bg-pink-500 rounded-full transition-all duration-75 ease-linear" style="width: 0%;"></div>
+    </div>
+    <script type="module">
+        // ---------- Globals ----------
+        let scene, camera, renderer, cube, platform, pillar;
+        let lowerBodyGroup, middleBodyGroup, upperBodyGroup;
+        let headMesh;
+
+        // Arm variables (groups and joints)
+        let armLeftGroup, armRightGroup, forearmLeftJoint, forearmRightJoint;
+        let shoulderLeftPivot, shoulderRightPivot; // Cần pivot vai để xoay trục Z cho nạp lực
+        let keys = {};
+        
+        // Tốc độ di chuyển cơ bản của nhân vật
+        const cubeSpeed = 0.15; 
+
+        // Ragdoll
+        let ragdollEnabled = false;
+        let forearmVelLeft = 0;
+        let forearmVelRight = 0;
+        const RAGDOLL_GRAVITY_TORQUE = 0.02;
+        const RAGDOLL_DAMPING = 0.98;
+
+        // Camera control
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+        
+        // Cài đặt camera
+        const spherical = new THREE.Spherical(8, Math.PI / 3, -Math.PI / 4);
+        
+        const MIN_CAMERA_WORLD_Y = 0.2;
+        const MIN_ACTUAL_RADIUS = 1.0;
+
+        // Physics
+        let verticalVelocity = 0;
+        // Trọng lực mới (0.08 cho cảm giác "Trái Đất" trong môi trường 3D này)
+        const gravity = 0.08; 
+        const BASE_JUMP_VELOCITY = 0.6; // Lực nhảy cơ bản (1x)
+        const raycaster = new THREE.Raycaster(); 
+        const collisionDistance = 0.5; 
+        let isCurrentlyAirborne = false; 
+
+        // Body sizes
+        const BODY_WIDTH = 0.8;
+        const BODY_DEPTH = 0.6;
+        const BODY_HEIGHT = 1.5;
+        const SEGMENT_HEIGHT = BODY_HEIGHT / 3;
+        const LEG_HEIGHT = 1.25;
+        const FOOT_HEIGHT = 0.1;
+
+        // Head/neck
+        const HEAD_SIZE = 0.5;
+        const NECK_HEIGHT = 0.2;
+        const NECK_WIDTH = 0.3;
+
+        // Arm constants
+        const ARM_LENGTH = 0.7;
+        const ARM_WIDTH = 0.2;
+        const ARM_DEPTH = 0.2;
+        const FOREARM_LENGTH = 0.8;
+        const HAND_LENGTH = 0.2;
+        const ARM_X_POSITION = (BODY_WIDTH / 2) + (ARM_WIDTH / 2) + 0.02; 
+        const playerHeight = BODY_HEIGHT + LEG_HEIGHT + FOOT_HEIGHT;
+        const playerCenterY = playerHeight / 2;
+
+        // Pivots
+        const HIP_JOINT_Y = playerCenterY - (BODY_HEIGHT / 2);
+        const SHOULDER_JOINT_Y = SEGMENT_HEIGHT - (SEGMENT_HEIGHT / 4);
+
+        // Smoothing
+        const IDLE_LERP_FACTOR = 0.2;
+
+        // Look limits
+        const MAX_LOOK_AT_PITCH = Math.PI / 3; 
+        const MAX_LOOK_AT_YAW = Math.PI / 3; 
+
+        // Walk anim
+        let legLeft, legRight, calfLeft, calfRight, footLeft, footRight;
+        let animationTime = 0;
+        
+        // Tốc độ hoạt ảnh chân
+        const walkSpeed = cubeSpeed * 5.0; 
+        
+        // Biên độ lắc chân
+        const maxLegSwing = Math.PI / 14; 
+        const maxStrafeZ = Math.PI / 10; 
+        const maxFootLift = Math.PI / 10;
+
+        // Biên độ lắc tay
+        const maxArmSwing = 30 * (Math.PI / 180); 
+        
+        // Danh sách các vật thể có thể va chạm
+        let collidableObjects = []; 
+
+        // Materials
+        const bodyMaterial = new THREE.MeshLambertMaterial({ transparent: true, opacity: 1.0 });
+        const bodyGeometry = new THREE.BoxGeometry(BODY_WIDTH, SEGMENT_HEIGHT, BODY_DEPTH);
+        const legMaterial = new THREE.MeshLambertMaterial({ color: 0x888888, transparent: true, opacity: 1.0 });
+        const armMaterial = new THREE.MeshLambertMaterial({ color: 0x999999, transparent: true, opacity: 1.0 });
+
+        // Element for status message
+        const statusMessageElement = document.getElementById('status-message');
+        const chargeBarElement = document.getElementById('charge-bar');
+        const chargeBarContainerElement = document.getElementById('charge-bar-container');
+        const jumpChargeTextElement = document.getElementById('jump-charge-text');
+        
+        // --- NEW JUMP LOGIC CONSTANTS ---
+        const groundY = playerCenterY;
+        let effectiveGroundY = groundY; // Vị trí Y thực tế của mặt đất (thay đổi khi squat)
+        
+        // 1. Base/Tap Jump
+        let jumpChargeStartTime = 0; // Thời gian nhấn Spacebar (performance.now())
+        const MIN_TAP_TIME_MS = 100; // 100ms
+        
+        // 2. Charge Jump (General)
+        let isCharging = false;
+        let jumpChargeTimer = 0; // Tính bằng khung hình (để dễ dàng đồng bộ với animation)
+        
+        // THAY ĐỔI: Giảm thời gian nạp lực Charge Stand xuống 0.9s
+        const MAX_CHARGE_STAND_SECONDS = 0.9;
+        const MAX_CHARGE_FRAMES = 60 * MAX_CHARGE_STAND_SECONDS; 
+        
+        // 3. Charge Stand (Đứng Yên)
+        const MAX_CHARGE_STAND_MULTIPLIER = 1.6;
+        // Animation Stand Charge
+        // Giữ nguyên: Góc xoay vai (trục Z) đã giảm 1/2 từ yêu cầu trước đó
+        const MAX_ARM_SWING_Z = -75 * (Math.PI / 180) / 2; // -37.5 độ cho Upper Arm (trục Z)
+        const MAX_FOREARM_BEND_X = -90 * (Math.PI / 180); // -90 độ cho Forearm (trục X)
+
+        // 4. Charge Move (Di Chuyển)
+        // THAY ĐỔI: Thời gian nạp lực Max cho Charge Move là 0.8 giây
+        const MAX_CHARGE_MOVE_SECONDS = 0.8;
+        const MIN_CHARGE_MOVE_FRAMES = 60 * MAX_CHARGE_MOVE_SECONDS; // Sử dụng hằng số này để tính toán tỷ lệ
+        const MAX_CHARGE_MOVE_MULTIPLIER = 1.4;
+
+        // Charge type tracking
+        let chargeType = 'NONE'; // 'STAND', 'MOVE', 'NONE'
+        
+        // Hoạt ảnh Squat
+        const MAX_SQUAT_KNEE_BEND = (Math.PI / 6); 
+        const MAX_BODY_LEAN = 15 * (Math.PI / 180); 
+        const MAX_SQUAT_DROP_Y = 0.4; 
+        const SQUAT_LERP = 0.5; // Tốc độ lerp cho animation squat
+
+        // Hoạt ảnh Tap Jump
+        let jumpAnimationTimer = 0;
+        const JUMP_ANIMATION_DURATION = 15; // 15 frames
+        let isJumpAnimating = false;
+        let activeJumpLeg = 'LEFT'; // Chân nào co lên khi nhảy
+        const MAX_JUMP_LEG_LIFT_X = 25 * (Math.PI / 180); // Nhấc chân trước
+        const MAX_JUMP_KNEE_BEND_X = 40 * (Math.PI / 180); // Gập gối khi nhấc
+        
+        // ---------- Arm creation (Giữ nguyên) ----------
+        function createArm(side) {
+            const upperArmHeight = ARM_LENGTH;
+            const forearmHeight = FOREARM_LENGTH;
+            const handHeight = HAND_LENGTH;
+
+            const upperArmGeometry = new THREE.BoxGeometry(ARM_WIDTH, upperArmHeight, ARM_DEPTH);
+            const forearmGeometry = new THREE.BoxGeometry(ARM_WIDTH, forearmHeight, ARM_DEPTH);
+            const handGeometry = new THREE.BoxGeometry(ARM_WIDTH * 1.5, handHeight, ARM_DEPTH * 1.5);
+
+            const armGroup = new THREE.Group();
+            armGroup.name = `ArmGroup${side}`;
+            armGroup.position.x = side === 'Left' ? -ARM_X_POSITION : ARM_X_POSITION;
+            armGroup.position.y = SHOULDER_JOINT_Y;
+
+            // Shoulder pivot with static outward rotation
+            const shoulderPivot = new THREE.Group();
+            shoulderPivot.name = `ShoulderPivot${side}`;
+            shoulderPivot.position.y = 0;
+            
+            // Góc xoay vai (trục Z) để cánh tay hướng ra ngoài một chút
+            const outwardAngle = -0.3; 
+            shoulderPivot.rotation.z = side === 'Left' ? outwardAngle : -outwardAngle;
+
+            armGroup.add(shoulderPivot);
+
+            // Upper arm mesh (top aligned to pivot)
+            const upperArmMesh = new THREE.Mesh(upperArmGeometry, armMaterial.clone());
+            upperArmMesh.name = `UpperArmMesh${side}`;
+            upperArmMesh.position.y = -upperArmHeight / 2;
+            upperArmMesh.position.x = side === 'Left' ? ARM_WIDTH * 0.25 : -ARM_WIDTH * 0.25;
+            shoulderPivot.add(upperArmMesh);
+
+            // Elbow group attached to shoulderPivot; offset X so forearm+hand are outside torso
+            const elbowGroup = new THREE.Group();
+            elbowGroup.name = `ElbowJoint${side}`;
+            elbowGroup.position.y = -upperArmHeight;
+            
+            // Đặt offset dịch chuyển khuỷu tay ngang âm để đẩy khớp khuỷu vào trong (tạo hình chữ 'A' nhẹ)
+            const elbowOutwardOffset = -0.05; 
+            
+            elbowGroup.position.x = side === 'Left' ? -elbowOutwardOffset : elbowOutwardOffset;
+            
+            shoulderPivot.add(elbowGroup);
+
+            // Forearm mesh
+            const forearmMesh = new THREE.Mesh(forearmGeometry, armMaterial.clone());
+            forearmMesh.name = `ForearmMesh${side}`;
+            forearmMesh.position.y = -forearmHeight / 2;
+            elbowGroup.add(forearmMesh);
+
+            // Wrist and hand
+            const wristGroup = new THREE.Group();
+            wristGroup.name = `WristJoint${side}`;
+            wristGroup.position.y = -forearmHeight;
+            elbowGroup.add(wristGroup);
+
+            // Hand mesh
+            const handMesh = new THREE.Mesh(handGeometry, armMaterial.clone());
+            handMesh.name = `HandMesh${side}`;
+            handMesh.position.y = -handHeight / 2;
+            // FIX LỖI: Sử dụng ARM_DEPTH thay vì handDepth chưa định nghĩa
+            handMesh.position.z = ARM_DEPTH / 4; 
+            wristGroup.add(handMesh);
+
+            return {
+                arm: armGroup,
+                shoulder: shoulderPivot, // Group cần để xoay Z cho animation Charge Stand
+                elbow: elbowGroup,
+                wrist: wristGroup
+            };
+        }
+
+        // ---------- Init (Giữ nguyên) ----------
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Mouse events
+            renderer.domElement.addEventListener('mousedown', onMouseDown, false);
+            renderer.domElement.addEventListener('mousemove', onMouseMove, false);
+            renderer.domElement.addEventListener('mouseup', onMouseUp, false);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 10, 7.5);
+            directionalLight.castShadow = true;
+            scene.add(directionalLight);
+
+            // Platform
+            const platformGeometry = new THREE.PlaneGeometry(30, 30);
+            const platformMaterial = new THREE.MeshLambertMaterial({ color: 0x283845, side: THREE.DoubleSide });
+            platform = new THREE.Mesh(platformGeometry, platformMaterial);
+            platform.rotation.x = Math.PI / 2;
+            platform.position.y = -0.5;
+            platform.receiveShadow = true;
+            scene.add(platform);
+            
+            const gridHelper = new THREE.GridHelper(30, 30, 0x555555, 0x555555);
+            gridHelper.position.y = -0.49;
+            scene.add(gridHelper);
+
+            // Character group
+            cube = new THREE.Group();
+            cube.castShadow = true; // Nhân vật đổ bóng
+
+            // Lower body
+            lowerBodyGroup = new THREE.Group();
+            lowerBodyGroup.name = "LowerBodyJoint";
+            lowerBodyGroup.position.y = HIP_JOINT_Y;
+            cube.add(lowerBodyGroup);
+            const lowerBodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial.clone());
+            lowerBodyMesh.material.color.set(0xff5555);
+            lowerBodyMesh.name = "LowerBodyMesh";
+            lowerBodyMesh.position.y = SEGMENT_HEIGHT / 2;
+            lowerBodyMesh.castShadow = true;
+            lowerBodyGroup.add(lowerBodyMesh);
+
+            // Middle body
+            middleBodyGroup = new THREE.Group();
+            middleBodyGroup.name = "MiddleBodyJoint";
+            middleBodyGroup.position.y = SEGMENT_HEIGHT;
+            lowerBodyGroup.add(middleBodyGroup);
+            const middleBodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial.clone());
+            middleBodyMesh.material.color.set(0x55ff55);
+            middleBodyMesh.name = "MiddleBodyMesh";
+            middleBodyMesh.position.y = SEGMENT_HEIGHT / 2;
+            middleBodyMesh.castShadow = true;
+            middleBodyGroup.add(middleBodyMesh);
+
+            // Upper body
+            upperBodyGroup = new THREE.Group();
+            upperBodyGroup.name = "UpperBodyJoint";
+            upperBodyGroup.position.y = SEGMENT_HEIGHT;
+            middleBodyGroup.add(upperBodyGroup);
+            const upperBodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial.clone());
+            upperBodyMesh.material.color.set(0x5555ff);
+            upperBodyMesh.name = "UpperBodyMesh";
+            upperBodyMesh.position.y = SEGMENT_HEIGHT / 2;
+            upperBodyMesh.castShadow = true;
+            upperBodyGroup.add(upperBodyMesh);
+
+            // Neck & head
+            const neckGeometry = new THREE.CylinderGeometry(NECK_WIDTH / 2, NECK_WIDTH / 2, NECK_HEIGHT, 12);
+            const neckMaterial = new THREE.MeshLambertMaterial({ color: 0xcccccc, transparent: true, opacity: 1.0 });
+            const neckMesh = new THREE.Mesh(neckGeometry, neckMaterial);
+            neckMesh.name = "NeckMesh";
+            neckMesh.position.y = SEGMENT_HEIGHT + (NECK_HEIGHT / 2);
+            neckMesh.castShadow = true;
+            upperBodyGroup.add(neckMesh);
+
+            const headGeometry = new THREE.BoxGeometry(HEAD_SIZE, HEAD_SIZE, HEAD_SIZE);
+            const headMaterial = new THREE.MeshLambertMaterial({ color: 0xffa500, transparent: true, opacity: 1.0 });
+            headMesh = new THREE.Mesh(headGeometry, headMaterial);
+            headMesh.name = "HeadMesh";
+            headMesh.position.y = SEGMENT_HEIGHT + NECK_HEIGHT + (HEAD_SIZE / 2);
+            headMesh.castShadow = true;
+            upperBodyGroup.add(headMesh);
+
+            // Arms
+            const leftArmParts = createArm('Left');
+            armLeftGroup = leftArmParts.arm;
+            forearmLeftJoint = leftArmParts.elbow;
+            shoulderLeftPivot = leftArmParts.shoulder; // LƯU PIVOT VAI
+            upperBodyGroup.add(armLeftGroup);
+
+            const rightArmParts = createArm('Right');
+            armRightGroup = rightArmParts.arm;
+            forearmRightJoint = rightArmParts.elbow;
+            shoulderRightPivot = rightArmParts.shoulder; // LƯU PIVOT VAI
+            upperBodyGroup.add(armRightGroup);
+
+            // Legs
+            const thighHeight = LEG_HEIGHT / 2;
+            const calfHeight = LEG_HEIGHT / 2;
+            const legWidth = 0.25;
+            const legDepth = 0.25;
+            const footWidth = legWidth * 1.5;
+            const footDepth = 0.5;
+            
+            // THÊM: Định nghĩa hình học cho chân
+            const thighGeometry = new THREE.BoxGeometry(legWidth, thighHeight, legDepth);
+            const calfGeometry = new THREE.BoxGeometry(legWidth, calfHeight, legDepth);
+            const footGeometry = new THREE.BoxGeometry(footWidth, FOOT_HEIGHT, footDepth);
+            
+            // Khoảng cách ngang giữa hai chân
+            const legXPosition = 0.20;
+
+            function createLeg(side) {
+                const legGroup = new THREE.Group();
+                legGroup.name = `Leg${side}`;
+                legGroup.position.x = side === 'Left' ? -legXPosition : legXPosition;
+                legGroup.position.y = 0;
+
+                const thighMesh = new THREE.Mesh(thighGeometry, legMaterial);
+                thighMesh.name = `ThighMesh${side}`;
+                thighMesh.position.y = -thighHeight / 2;
+                thighMesh.castShadow = true;
+                legGroup.add(thighMesh);
+
+                const kneeGroup = new THREE.Group();
+                kneeGroup.name = `KneeJoint${side}`;
+                kneeGroup.position.y = -thighHeight;
+                legGroup.add(kneeGroup);
+
+                const calfMesh = new THREE.Mesh(calfGeometry, legMaterial.clone());
+                calfMesh.name = `CalfMesh${side}`;
+                calfMesh.position.y = -calfHeight / 2;
+                calfMesh.castShadow = true;
+                kneeGroup.add(calfMesh);
+
+                const ankleGroup = new THREE.Group();
+                ankleGroup.name = `AnkleJoint${side}`;
+                ankleGroup.position.y = -calfHeight;
+                kneeGroup.add(ankleGroup);
+
+                const footMesh = new THREE.Mesh(footGeometry, legMaterial.clone());
+                footMesh.name = `FootMesh${side}`;
+                footMesh.position.y = -FOOT_HEIGHT / 2;
+                footMesh.position.z = footDepth / 4;
+                footMesh.castShadow = true;
+                ankleGroup.add(footMesh);
+
+                return {
+                    leg: legGroup,
+                    knee: kneeGroup,
+                    ankle: ankleGroup
+                };
+            }
+
+            const leftLegParts = createLeg('Left');
+            legLeft = leftLegParts.leg;
+            calfLeft = leftLegParts.knee;
+            footLeft = leftLegParts.ankle;
+            legLeft.position.y = HIP_JOINT_Y;
+            cube.add(legLeft);
+
+            const rightLegParts = createLeg('Right');
+            legRight = rightLegParts.leg;
+            calfRight = rightLegParts.knee;
+            footRight = rightLegParts.ankle;
+            legRight.position.y = HIP_JOINT_Y;
+            cube.add(legRight);
+
+            // Finalize character
+            cube.position.y = playerCenterY;
+            scene.add(cube);
+
+            // Pillar obstacle
+            const pillarGeometry = new THREE.CylinderGeometry(1, 1, 6, 32);
+            const pillarMaterial = new THREE.MeshLambertMaterial({ color: 0x607d8b });
+            pillar = new THREE.Mesh(pillarGeometry, pillarMaterial);
+            pillar.position.set(5, 3, 5);
+            pillar.castShadow = true;
+            pillar.receiveShadow = true;
+            scene.add(pillar);
+
+            // Chỉ thêm vật thể va chạm di chuyển vào collidableObjects
+            collidableObjects.push(pillar); 
+
+            // Camera initial position (sử dụng giá trị từ hằng số spherical đã sửa)
+            updateCameraPosition();
+            
+            // Renderer settings for shadows
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        }
+
+        // ---------- Mouse handlers (Giữ nguyên) ----------
+        function onMouseDown(event) {
+            isDragging = true;
+            previousMousePosition.x = event.clientX;
+            previousMousePosition.y = event.clientY;
+            renderer.domElement.style.cursor = 'grabbing';
+        }
+
+        function onMouseMove(event) {
+            if (!isDragging) return;
+
+            const deltaX = event.clientX - previousMousePosition.x;
+            const deltaY = event.clientY - previousMousePosition.y;
+
+            // Cập nhật góc Yaw (theta - xoay ngang)
+            spherical.theta -= deltaX * 0.005;
+            // Cập nhật góc Pitch (phi - xoay dọc)
+            spherical.phi -= deltaY * 0.005;
+
+            // Giới hạn góc phi (0.1 đến PI - 0.01) để camera không đi quá đỉnh hoặc quá đáy
+            spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.01, spherical.phi));
+
+            // Cập nhật vị trí chuột trước đó
+            previousMousePosition.x = event.clientX;
+            // Dùng event.clientY cho trục Y (đã sửa lỗi)
+            previousMousePosition.y = event.clientY; 
+        }
+
+        function onMouseUp() {
+            isDragging = false;
+            renderer.domElement.style.cursor = 'grab';
+        }
+
+        // ---------- Camera update (Giữ nguyên) ----------
+        function updateCameraPosition() {
+            const focusPoint = cube.position.clone();
+            focusPoint.y += SEGMENT_HEIGHT + NECK_HEIGHT + HEAD_SIZE / 2;
+
+            let actualRadius = spherical.radius;
+
+            // Check if camera is too low and clipping the floor
+            const projectedRelativeY = spherical.radius * Math.cos(spherical.phi);
+            const projectedWorldY = focusPoint.y + projectedRelativeY;
+
+            if (projectedWorldY < MIN_CAMERA_WORLD_Y) {
+                const requiredRelativeY = MIN_CAMERA_WORLD_Y - focusPoint.y;
+                if (Math.abs(Math.cos(spherical.phi)) > 0.001) {
+                    let newRadius = requiredRelativeY / Math.cos(spherical.phi);
+                    actualRadius = Math.max(MIN_ACTUAL_RADIUS, Math.min(spherical.radius, newRadius));
+                }
+            } else {
+                actualRadius = spherical.radius;
+            }
+
+            const position = new THREE.Vector3().setFromSphericalCoords(actualRadius, spherical.phi, spherical.theta);
+            position.add(focusPoint);
+            camera.position.copy(position);
+            camera.lookAt(focusPoint);
+
+            // Fade character when camera is close
+            const fadeStartDistance = 5.0;
+            const fadeEndDistance = 2.0;
+            let opacity = (actualRadius - fadeEndDistance) / (fadeStartDistance - fadeEndDistance);
+            opacity = THREE.MathUtils.clamp(opacity, 0.0, 1.0);
+
+            cube.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => { m.opacity = opacity; m.needsUpdate = true; });
+                    } else {
+                        child.material.opacity = opacity;
+                        child.material.needsUpdate = true;
+                    }
+                }
+            });
+        }
+
+        // ---------- Spine look-at (Giữ nguyên) ----------
+        function updateSpineLookAt() {
+            const cameraDirection = new THREE.Vector3();
+            camera.getWorldDirection(cameraDirection);
+
+            // 1. Tính góc nhìn tuyệt đối của camera (World Yaw)
+            const cameraWorldYaw = Math.atan2(cameraDirection.x, cameraDirection.z);
+            
+            // 2. Lấy góc xoay tuyệt đối của nhân vật
+            const characterWorldYaw = cube.rotation.y;
+
+            // 3. Tính góc tương đối (Relative Yaw) - Đây là FIX chính
+            let relativeYaw = cameraWorldYaw - characterWorldYaw;
+
+            // Đảm bảo góc quay nằm trong khoảng [-PI, PI] (Tương đương 360 độ)
+            while (relativeYaw > Math.PI) relativeYaw -= 2 * Math.PI;
+            while (relativeYaw < -Math.PI) relativeYaw += 2 * Math.PI;
+
+            // Tính toán Pitch (góc nhìn lên/xuống)
+            const horizontalLookDistance = Math.sqrt(cameraDirection.x * cameraDirection.x + cameraDirection.z * cameraDirection.z);
+            let cameraLookPitch = Math.atan2(cameraDirection.y, horizontalLookDistance);
+            
+            // Clamp rotation limits
+            const clampedYaw = THREE.MathUtils.clamp(relativeYaw, -MAX_LOOK_AT_YAW, MAX_LOOK_AT_YAW);
+            cameraLookPitch = THREE.MathUtils.clamp(cameraLookPitch, -MAX_LOOK_AT_PITCH, MAX_LOOK_AT_PITCH);
+
+            const lerpFactor = 0.15;
+            
+            // Invert pitch for spine (looking up means spine bends back/down)
+            const spinePitch = -cameraLookPitch; 
+            const spineYaw = clampedYaw;
+
+            // Apply rotation to body segments for smooth look-at effect (Inverse Kinematics approximation)
+            // Phân bổ góc quay: (0.2 + 0.3 + 0.5 = 1.0)
+            
+            // Áp dụng góc xoay Y (Yaw)
+            lowerBodyGroup.rotation.y = THREE.MathUtils.lerp(lowerBodyGroup.rotation.y, spineYaw * 0.3, lerpFactor);
+            middleBodyGroup.rotation.y = THREE.MathUtils.lerp(middleBodyGroup.rotation.y, spineYaw * 0.3, lerpFactor);
+            upperBodyGroup.rotation.y = THREE.MathUtils.lerp(upperBodyGroup.rotation.y, spineYaw * 0.4, lerpFactor);
+            
+            // Áp dụng góc xoay X (Pitch) - Lưu ý: Hoạt ảnh squat được xử lý trong handleInput
+            const targetLowerPitch = spinePitch * 0.2;
+            // Kiểm tra nếu đang squat (Charge Stand) thì không override X-rotation do squat
+            if (chargeType !== 'STAND' || !isCharging) {
+                lowerBodyGroup.rotation.x = THREE.MathUtils.lerp(lowerBodyGroup.rotation.x, targetLowerPitch, lerpFactor);
+                middleBodyGroup.rotation.x = THREE.MathUtils.lerp(middleBodyGroup.rotation.x, spinePitch * 0.3, lerpFactor);
+                upperBodyGroup.rotation.x = THREE.MathUtils.lerp(upperBodyGroup.rotation.x, spinePitch * 0.5, lerpFactor);
+            }
+
+            // Head rotates to compensate the remaining angle
+            if (headMesh) {
+                // Góc xoay Y của đầu: bù trừ cho góc xoay Y của toàn bộ thân 
+                const totalBodyYaw = lowerBodyGroup.rotation.y + middleBodyGroup.rotation.y + upperBodyGroup.rotation.y;
+                const neededYaw = spineYaw - totalBodyYaw;
+                const neededPitch = spinePitch - upperBodyGroup.rotation.x;
+                
+                // Tăng hệ số lerp để đầu xoay nhanh và nhạy hơn
+                headMesh.rotation.y = THREE.MathUtils.lerp(headMesh.rotation.y, neededYaw, lerpFactor * 3.5);
+                headMesh.rotation.x = THREE.MathUtils.lerp(headMesh.rotation.x, neededPitch, lerpFactor * 2.5);
+            }
+        }
+        
+        // ---------- Hoạt ảnh tay Nạp Lực (Charge Stand) (Giữ nguyên) ----------
+        function updateChargeStandArms(chargeRatio) {
+            // Tỷ lệ nạp lực từ 0 đến 1
+            const lerpFactor = 0.2;
+            
+            // 1. Upper Arm: Đu đưa sang ngang (trục Z)
+            const targetArmZ = MAX_ARM_SWING_Z * chargeRatio;
+            shoulderLeftPivot.rotation.z = THREE.MathUtils.lerp(shoulderLeftPivot.rotation.z, targetArmZ, lerpFactor);
+            shoulderRightPivot.rotation.z = THREE.MathUtils.lerp(shoulderRightPivot.rotation.z, -targetArmZ, lerpFactor);
+
+            // 2. Forearm: Gập về phía trước (trục X)
+            const targetForearmX = MAX_FOREARM_BEND_X * chargeRatio;
+            forearmLeftJoint.rotation.x = THREE.MathUtils.lerp(forearmLeftJoint.rotation.x, targetForearmX, lerpFactor);
+            forearmRightJoint.rotation.x = THREE.MathUtils.lerp(forearmRightJoint.rotation.x, targetForearmX, lerpFactor);
+            
+            // 3. Xoay vai trục X (để cánh tay không bị rủ xuống)
+            armLeftGroup.rotation.x = THREE.MathUtils.lerp(armLeftGroup.rotation.x, 0, lerpFactor);
+            armRightGroup.rotation.x = THREE.MathUtils.lerp(armRightGroup.rotation.x, 0, lerpFactor);
+        }
+
+        // ---------- Arms update (Giữ nguyên) ----------
+        function updateArmLookAt(isMoving, isAirborne) {
+            
+            let isStandCharge = isCharging && chargeType === 'STAND';
+            
+            if (isStandCharge) {
+                // Nếu đang Charge Stand, áp dụng animation nạp lực
+                let chargeRatio = jumpChargeTimer / MAX_CHARGE_FRAMES;
+                chargeRatio = THREE.MathUtils.clamp(chargeRatio, 0.0, 1.0);
+                updateChargeStandArms(chargeRatio);
+                return; // Ngừng các hoạt ảnh tay khác
+            }
+
+            // ... (Phần logic cánh tay bình thường/ragdoll)
+            const bodyPitch = upperBodyGroup.rotation.x;
+            const targetShoulderPitch = bodyPitch * 1.5; 
+            const targetElbowBend = -(Math.abs(bodyPitch) * 0.5 + 0.1); 
+
+            // Arm swing when walking
+            const swing = isMoving ? Math.sin(animationTime) * maxArmSwing : 0; 
+
+            if (ragdollEnabled) {
+                // Simple angular velocity ragdoll on forearms
+                forearmVelLeft += RAGDOLL_GRAVITY_TORQUE;
+                forearmVelLeft *= RAGDOLL_DAMPING;
+                forearmLeftJoint.rotation.x += forearmVelLeft;
+
+                forearmVelRight += RAGDOLL_GRAVITY_TORQUE;
+                forearmVelRight *= RAGDOLL_DAMPING;
+                forearmRightJoint.rotation.x += forearmVelRight;
+
+                const ragdollArmLerp = 0.05; 
+                const targetRightX = -swing + targetShoulderPitch;
+                const targetLeftX = swing + targetShoulderPitch;
+                
+                armRightGroup.rotation.x = THREE.MathUtils.lerp(armRightGroup.rotation.x, targetRightX, ragdollArmLerp);
+                armLeftGroup.rotation.x = THREE.MathUtils.lerp(armLeftGroup.rotation.x, targetLeftX, ragdollArmLerp);
+                
+                // Reset Z rotation from charging
+                shoulderLeftPivot.rotation.z = THREE.MathUtils.lerp(shoulderLeftPivot.rotation.z, -0.3, ragdollArmLerp);
+                shoulderRightPivot.rotation.z = THREE.MathUtils.lerp(shoulderRightPivot.rotation.z, 0.3, ragdollArmLerp);
+                
+            } else {
+                // Normal walking/idle pose
+                const targetRightX = -swing + targetShoulderPitch;
+                const targetLeftX = swing + targetShoulderPitch;
+
+                armRightGroup.rotation.x = THREE.MathUtils.lerp(armRightGroup.rotation.x, targetRightX, IDLE_LERP_FACTOR);
+                forearmRightJoint.rotation.x = THREE.MathUtils.lerp(forearmRightJoint.rotation.x, targetElbowBend, IDLE_LERP_FACTOR);
+
+                armLeftGroup.rotation.x = THREE.MathUtils.lerp(armLeftGroup.rotation.x, targetLeftX, IDLE_LERP_FACTOR);
+                forearmLeftJoint.rotation.x = THREE.MathUtils.lerp(forearmLeftJoint.rotation.x, targetElbowBend, IDLE_LERP_FACTOR);
+                
+                // Reset Z rotation from charging (trở lại vị trí tĩnh -0.3/-0.3)
+                const initialOutwardAngle = -0.3;
+                shoulderLeftPivot.rotation.z = THREE.MathUtils.lerp(shoulderLeftPivot.rotation.z, initialOutwardAngle, IDLE_LERP_FACTOR);
+                shoulderRightPivot.rotation.z = THREE.MathUtils.lerp(shoulderRightPivot.rotation.z, -initialOutwardAngle, IDLE_LERP_FACTOR);
+            }
+        }
+        
+        // ---------- Hoạt ảnh Nhảy Base (Tap Jump) (Giữ nguyên) ----------
+        function updateJumpAnimation() {
+            if (!isJumpAnimating) {
+                jumpAnimationTimer = 0;
+                // Nếu đang tiếp đất và không nhảy/nạp lực, reset chân ngay lập tức
+                if (cube.position.y <= effectiveGroundY + 0.01 && !isCharging) {
+                    legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                    calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                }
+                return;
+            }
+
+            jumpAnimationTimer++;
+            if (jumpAnimationTimer > JUMP_ANIMATION_DURATION) {
+                isJumpAnimating = false;
+                return;
+            }
+
+            // Tỷ lệ hoạt ảnh (dạng Ease-Out, tập trung ở nửa đầu)
+            const ratio = 1 - (jumpAnimationTimer / JUMP_ANIMATION_DURATION);
+            const intensity = Math.sin(ratio * Math.PI) * 1.5; // Dạng sóng sin cho độ nảy
+
+            const activeLeg = activeJumpLeg === 'LEFT' ? legLeft : legRight;
+            const activeCalf = activeJumpLeg === 'LEFT' ? calfLeft : calfRight;
+            const passiveLeg = activeJumpLeg === 'LEFT' ? legRight : legLeft;
+            const passiveCalf = activeJumpLeg === 'LEFT' ? calfRight : calfLeft;
+            
+            // Chân chủ động (co lên)
+            const liftRotation = intensity * MAX_JUMP_LEG_LIFT_X;
+            const bendRotation = intensity * MAX_JUMP_KNEE_BEND_X;
+
+            activeLeg.rotation.x = THREE.MathUtils.lerp(activeLeg.rotation.x, liftRotation, 0.5);
+            activeCalf.rotation.x = THREE.MathUtils.lerp(activeCalf.rotation.x, -bendRotation, 0.5);
+
+            // Chân bị động (chân đẩy) - co lại sau đó duỗi ra
+            passiveLeg.rotation.x = THREE.MathUtils.lerp(passiveLeg.rotation.x, -liftRotation * 0.5, 0.5);
+            passiveCalf.rotation.x = THREE.MathUtils.lerp(passiveCalf.rotation.x, liftRotation * 0.5, 0.5);
+        }
+
+        // ---------- Collision Detection Function (Giữ nguyên) ----------
+        function checkCollision(movementVector) {
+            const directions = [
+                new THREE.Vector3(0, 0, 1),   // Forward
+                new THREE.Vector3(0, 0, -1),  // Backward
+                new THREE.Vector3(1, 0, 0),   // Right
+                new THREE.Vector3(-1, 0, 0)   // Left
+            ];
+
+            const originPoint = cube.position.clone();
+            let collisionOccurred = false;
+
+            for (let i = 0; i < directions.length; i++) {
+                const direction = directions[i].applyQuaternion(cube.quaternion);
+                
+                raycaster.set(originPoint, direction);
+                raycaster.far = collisionDistance; // Chỉ kiểm tra va chạm trong phạm vi gần
+                
+                // Trừ platform (chỉ kiểm tra với các vật thể di chuyển được)
+                const intersects = raycaster.intersectObjects(collidableObjects, true);
+
+                if (intersects.length > 0 && intersects[0].distance < collisionDistance) {
+                    // Nếu có va chạm gần
+                    
+                    // Tính góc giữa hướng va chạm và hướng di chuyển
+                    const dotProduct = direction.dot(movementVector);
+                    
+                    // Nếu hướng di chuyển trùng với hướng va chạm (dotProduct > 0.01)
+                    if (dotProduct > 0.01) {
+                        // Ngăn chặn chuyển động theo hướng đó
+                        // Bằng cách trừ đi thành phần va chạm khỏi vector di chuyển
+                        movementVector.sub(direction.multiplyScalar(dotProduct));
+                        collisionOccurred = true;
+                    }
+                }
+            }
+
+            return collisionOccurred;
+        }
+
+        // ---------- Hàm Kích hoạt Nhảy Tụ lực (ĐÃ SỬA LẠI LOGIC TÍNH CHARGE MOVE) ----------
+        function triggerChargedJump() {
+            if (!isCharging) return;
+            
+            isCharging = false;
+            chargeBarContainerElement.style.opacity = '0';
+            jumpChargeTextElement.textContent = `0.0s`;
+            
+            let finalMultiplier = 1.0;
+            let currentChargeType = chargeType;
+            
+            if (currentChargeType === 'STAND') {
+                // Charge Stand: Max 1.6x base (tuyến tính)
+                // Tỷ lệ nạp lực (0.0s -> 0.9s)
+                let chargeRatio = jumpChargeTimer / MAX_CHARGE_FRAMES;
+                chargeRatio = THREE.MathUtils.clamp(chargeRatio, 0.0, 1.0);
+                
+                const bonus = MAX_CHARGE_STAND_MULTIPLIER - 1.0;
+                finalMultiplier = 1.0 + (chargeRatio * bonus);
+                
+                // Đảm bảo nhân vật trở về vị trí Y ban đầu
+                cube.position.y = groundY;
+                effectiveGroundY = groundY;
+                
+            } else if (currentChargeType === 'MOVE') {
+                // Charge Move: Max 1.4x (đạt tối đa sau 0.8 giây)
+                
+                // Tỷ lệ nạp lực: Thời gian nạp so với 0.8s
+                let chargeRatio = jumpChargeTimer / MIN_CHARGE_MOVE_FRAMES;
+                chargeRatio = THREE.MathUtils.clamp(chargeRatio, 0.0, 1.0);
+                
+                // Lực nhảy: 1.0 + (Bonus * Tỷ lệ nạp lực)
+                const bonus = MAX_CHARGE_MOVE_MULTIPLIER - 1.0;
+                finalMultiplier = 1.0 + (bonus * chargeRatio);
+            }
+            
+            // Kích hoạt nhảy
+            verticalVelocity = BASE_JUMP_VELOCITY * finalMultiplier;
+            animationTime = 0; 
+            
+            statusMessageElement.innerHTML = `Trạng thái: <strong>NHẢY NẠP LỰC! Lực: ${finalMultiplier.toFixed(1)}x (${currentChargeType})</strong>`;
+            
+            chargeType = 'NONE'; // Reset type
+            jumpChargeTimer = 0; // Reset timer
+            isJumpAnimating = true; // Kích hoạt hoạt ảnh nhảy
+        }
+
+        // ---------- Input & physics (ĐÃ SỬA LẠI LOGIC TÍNH BAR DISPLAY) ----------
+        function handleInput() {
+            const moveVector = new THREE.Vector3(0, 0, 0);
+            const forward = new THREE.Vector3();
+            camera.getWorldDirection(forward);
+            forward.y = 0;
+            forward.normalize();
+            const right = new THREE.Vector3();
+            right.crossVectors(forward, new THREE.Vector3(0, 1, 0));
+
+            const isGroundContact = cube.position.y <= groundY + 0.01;
+
+            // Cập nhật trạng thái trên không
+            isCurrentlyAirborne = !isGroundContact; 
+
+            // 1. XÁC ĐỊNH INPUT VÀ TRẠNG THÁI DI CHUYỂN
+            const movementInputHappened = keys['w'] || keys['s'] || keys['a'] || keys['d'];
+            const isMoving = movementInputHappened; 
+            const isJumpInputHeld = keys.Space;
+            
+            // 2. LOGIC NẠP LỰC (CHARGE)
+            if (isJumpInputHeld && isGroundContact) {
+                const chargeDuration = performance.now() - jumpChargeStartTime;
+                
+                // Nếu giữ quá ngưỡng Tap (100ms) VÀ chưa ở trạng thái charging
+                if (chargeDuration >= MIN_TAP_TIME_MS && !isCharging) {
+                    isCharging = true;
+                    // Phân loại loại nạp lực (Đứng Yên hay Di Chuyển)
+                    chargeType = isMoving ? 'MOVE' : 'STAND'; 
+                    jumpChargeTimer = 0; // Bắt đầu tính bằng frame
+                    
+                    chargeBarContainerElement.style.opacity = '1';
+                    statusMessageElement.innerHTML = `Trạng thái: <strong>Đang Nạp Lực Nhảy (${chargeType})...</strong>`;
+                }
+
+                // Nếu đang nạp lực (sau 100ms đầu tiên)
+                if (isCharging) {
+                    
+                    // Xác định Max Frame dựa trên loại nạp lực
+                    const maxFrames = chargeType === 'STAND' ? MAX_CHARGE_FRAMES : MIN_CHARGE_MOVE_FRAMES;
+                    
+                    // Tăng bộ đếm thời gian, giới hạn
+                    jumpChargeTimer = Math.min(maxFrames, jumpChargeTimer + 1);
+
+                    // Tính toán tỷ lệ nạp lực (từ 0.0 đến 1.0) để HIỂN THỊ BAR
+                    let chargeRatio = jumpChargeTimer / maxFrames;
+
+                    // Cập nhật thanh nạp
+                    chargeBarElement.style.width = `${chargeRatio * 100}%`;
+                    jumpChargeTextElement.textContent = `${(jumpChargeTimer / 60).toFixed(1)}s`;
+                }
+            } else if (!isJumpInputHeld && isCharging) {
+                // Trường hợp người chơi nhả phím (an toàn)
+                triggerChargedJump(); 
+            }
+            
+            // 3. LOGIC HOẠT ẢNH SQUAT/VỊ TRÍ Y
+            let isStandCharge = isCharging && chargeType === 'STAND';
+            
+            if (isStandCharge) {
+                // ÁP DỤNG HOẠT ẢNH SQUAT (Chỉ khi Charge Stand)
+                let chargeRatio = jumpChargeTimer / MAX_CHARGE_FRAMES;
+                chargeRatio = THREE.MathUtils.clamp(chargeRatio, 0.0, 1.0);
+                
+                // 1. Độ Gập Gối và Nghiêng Người
+                const targetKneeBend = chargeRatio * MAX_SQUAT_KNEE_BEND; 
+                const thighRotation = -targetKneeBend * 2.0; 
+                const calfRotation = targetKneeBend * 4.0; 
+                
+                const totalLean = chargeRatio * MAX_BODY_LEAN; 
+                const lowerLean = totalLean * 0.4;
+                const middleLean = totalLean * 0.6;
+                
+                // 2. LÚN XUỐNG (Vertical Drop)
+                const targetDropY = groundY - (chargeRatio * MAX_SQUAT_DROP_Y);
+                effectiveGroundY = targetDropY;
+
+                // Áp dụng squat animation
+                legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, thighRotation, SQUAT_LERP);
+                legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, thighRotation, SQUAT_LERP);
+                calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, calfRotation, SQUAT_LERP);
+                calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, calfRotation, SQUAT_LERP);
+                
+                lowerBodyGroup.rotation.x = THREE.MathUtils.lerp(lowerBodyGroup.rotation.x, lowerLean, SQUAT_LERP);
+                middleBodyGroup.rotation.x = THREE.MathUtils.lerp(middleBodyGroup.rotation.x, middleLean, SQUAT_LERP);
+                upperBodyGroup.rotation.x = THREE.MathUtils.lerp(upperBodyGroup.rotation.x, -(lowerLean + middleLean) * 0.5, SQUAT_LERP);
+                
+                // Dịch chuyển gốc nhân vật (center of mass) xuống
+                cube.position.y = THREE.MathUtils.lerp(cube.position.y, effectiveGroundY, SQUAT_LERP);
+                
+            } else {
+                // Reset vị trí Y và animation (khi Charge Move hoặc không sạc)
+                effectiveGroundY = groundY;
+                // Đảm bảo vị trí Y trở về groundY khi đứng yên/di chuyển và không sạc
+                const lerpSpeed = (isCharging && chargeType === 'MOVE') ? 0.05 : IDLE_LERP_FACTOR;
+                if (cube.position.y > groundY + 0.01) {
+                    // Nếu đang Charge Move, không lerp quá nhanh để giữ vị trí
+                    cube.position.y = THREE.MathUtils.lerp(cube.position.y, effectiveGroundY, lerpSpeed);
+                }
+            }
+            
+            // 4. LOGIC DI CHUYỂN NGANG
+            // Di chuyển bị chặn chỉ khi đang Charge Stand
+            if (!isStandCharge) {
+                if (keys['w']) { moveVector.add(forward); }
+                if (keys['s']) { moveVector.sub(forward); }
+                if (keys['a']) { moveVector.sub(right); }
+                if (keys['d']) { moveVector.add(right); }
+                
+                if (moveVector.length() > 0) {
+                    moveVector.normalize().multiplyScalar(cubeSpeed);
+                    
+                    // KIỂM TRA VA CHẠM
+                    const hit = checkCollision(moveVector);
+                    if (hit) {
+                        statusMessageElement.innerHTML = `Trạng thái: <strong>Va chạm!</strong> (Thử đi hướng khác)`;
+                    } else if (isCharging && chargeType === 'MOVE') {
+                        statusMessageElement.innerHTML = `Trạng thái: <strong>Đang Nạp Lực Nhảy (MOVE)...</strong>`;
+                    } else if (!isCharging) {
+                        statusMessageElement.innerHTML = `Trạng thái: <strong>Di chuyển bình thường.</strong>`;
+                    }
+                    
+                    cube.position.add(moveVector);
+                } else if (!isCharging) {
+                    statusMessageElement.innerHTML = `Trạng thái: <strong>Sẵn sàng.</strong>`;
+                }
+            }
+            
+            const effectiveTotalMovement = moveVector.length();
+
+            // Xoay nhân vật theo hướng di chuyển (Chỉ khi không nạp lực đứng yên)
+            if (effectiveTotalMovement > 0.0001 && !isStandCharge) {
+                const targetRotationY = Math.atan2(moveVector.x, moveVector.z);
+                
+                let angleDifference = targetRotationY - cube.rotation.y;
+                while (angleDifference > Math.PI) angleDifference -= 2 * Math.PI;
+                while (angleDifference < -Math.PI) angleDifference += 2 * Math.PI;
+                
+                const rotationLerpFactor = 0.1;
+                cube.rotation.y += angleDifference * rotationLerpFactor;
+            }
+            
+            // 5. PHYSICS (Gravity & Ground Snap)
+            // Lực hút
+            if (isCurrentlyAirborne || verticalVelocity !== 0) {
+                verticalVelocity -= gravity;
+                cube.position.y += verticalVelocity;
+            }
+
+            // Ground snap: Snap về effectiveGroundY
+            if (cube.position.y <= effectiveGroundY) {
+                cube.position.y = effectiveGroundY;
+                verticalVelocity = 0;
+                isCurrentlyAirborne = false; 
+            } else if (isStandCharge) {
+                // Đảm bảo không nhảy lên nếu đang Charge Stand
+                if (verticalVelocity > 0) {
+                    verticalVelocity = 0; 
+                }
+            }
+            
+            // 6. ANIMATION LOGIC (Walking/Idle/Jump)
+            
+            // Nếu đang nhảy base, ưu tiên hoạt ảnh nhảy
+            if (isJumpAnimating) {
+                updateJumpAnimation();
+            } else if (!isStandCharge) {
+                // Animation chạy khi di chuyển HOẶC khi không nạp lực stand
+                if (effectiveTotalMovement > 0.0001 && !isCurrentlyAirborne) {
+                    // WALKING ANIMATION LOGIC
+                    animationTime += walkSpeed * effectiveTotalMovement; 
+
+                    // Tính toán các thành phần chuyển động (forward/backward và strafe)
+                    const normalizedMoveVector = moveVector.clone().normalize();
+                    
+                    const characterForward = new THREE.Vector3(0, 0, 1).applyQuaternion(cube.quaternion); 
+                    const fwd_bwd_scale = normalizedMoveVector.dot(characterForward);
+                    const strafeMovement = normalizedMoveVector.dot(new THREE.Vector3(1, 0, 0).applyQuaternion(cube.quaternion));
+
+                    // 1. X-Rotation (Tiến/Lùi)
+                    const x_swing_amp = Math.sin(animationTime) * maxLegSwing;
+                    const targetLegLeftX = x_swing_amp * fwd_bwd_scale;
+                    const targetLegRightX = -x_swing_amp * fwd_bwd_scale;
+
+                    // 2. Z-Rotation (Ngang/Strafe)
+                    let targetLegLeftZ = 0;
+                    let targetLegRightZ = 0;
+                    const z_swing_cycle = Math.sin(animationTime);
+                    
+                    if (Math.abs(strafeMovement) > 0.1) {
+                        const strafeAmplitude = strafeMovement; 
+                        if (strafeAmplitude > 0) { 
+                            targetLegRightZ = z_swing_cycle * maxStrafeZ;
+                            targetLegLeftZ = -z_swing_cycle * maxStrafeZ * 0.5; 
+                        } else { 
+                            targetLegLeftZ = -z_swing_cycle * maxStrafeZ;
+                            targetLegRightZ = z_swing_cycle * maxStrafeZ * 0.5; 
+                        }
+                        if (fwd_bwd_scale < 0) {
+                            targetLegLeftZ *= -1;
+                            targetLegRightZ *= -1;
+                        }
+                    }
+
+                    // Áp dụng X và Z-rotation
+                    legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, targetLegLeftX, IDLE_LERP_FACTOR);
+                    legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, targetLegRightX, IDLE_LERP_FACTOR);
+
+                    legLeft.rotation.z = THREE.MathUtils.lerp(legLeft.rotation.z, targetLegLeftZ, IDLE_LERP_FACTOR);
+                    legRight.rotation.z = THREE.MathUtils.lerp(legRight.rotation.z, targetLegRightZ, IDLE_LERP_FACTOR);
+                    
+                    legLeft.rotation.y = THREE.MathUtils.lerp(legLeft.rotation.y, 0, IDLE_LERP_FACTOR);
+                    legRight.rotation.y = THREE.MathUtils.lerp(legRight.rotation.y, 0, IDLE_LERP_FACTOR);
+
+
+                    // 3. Knee Bend & Foot Lift 
+                    const fwdDominance = Math.abs(fwd_bwd_scale);
+                    const kneeBendScale = Math.abs(x_swing_amp) * 0.8 * fwdDominance; 
+                    
+                    calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, kneeBendScale, IDLE_LERP_FACTOR);
+                    calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, kneeBendScale, IDLE_LERP_FACTOR);
+
+                    const footLiftScale = Math.sin(animationTime) * maxFootLift * fwdDominance;
+                    footLeft.rotation.x = THREE.MathUtils.lerp(footLeft.rotation.x, footLiftScale, IDLE_LERP_FACTOR);
+                    footRight.rotation.x = THREE.MathUtils.lerp(footRight.rotation.x, -footLiftScale, IDLE_LERP_FACTOR);
+                    
+                    // Reset body lean from charging (Quan trọng để không bị giữ lại squat)
+                    lowerBodyGroup.rotation.x = THREE.MathUtils.lerp(lowerBodyGroup.rotation.x, 0, IDLE_LERP_FACTOR);
+                    middleBodyGroup.rotation.x = THREE.MathUtils.lerp(middleBodyGroup.rotation.x, 0, IDLE_LERP_FACTOR);
+                    upperBodyGroup.rotation.x = THREE.MathUtils.lerp(upperBodyGroup.rotation.x, 0, IDLE_LERP_FACTOR);
+
+                } else {
+                    // Idle pose (return to rest & reset squat animation)
+                    animationTime += 0.02; 
+                    
+                    // Reset Leg Rotations (Squat & Walk)
+                    legLeft.rotation.x = THREE.MathUtils.lerp(legLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    legRight.rotation.x = THREE.MathUtils.lerp(legRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                    calfLeft.rotation.x = THREE.MathUtils.lerp(calfLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    calfRight.rotation.x = THREE.MathUtils.lerp(calfRight.rotation.x, 0, IDLE_LERP_FACTOR);
+                    footLeft.rotation.x = THREE.MathUtils.lerp(footLeft.rotation.x, 0, IDLE_LERP_FACTOR);
+                    footRight.rotation.x = THREE.MathUtils.lerp(footRight.rotation.x, 0, IDLE_LERP_FACTOR);
+
+                    // Reset Z/Y Rotations
+                    legLeft.rotation.z = THREE.MathUtils.lerp(legLeft.rotation.z, 0, IDLE_LERP_FACTOR);
+                    legRight.rotation.z = THREE.MathUtils.lerp(legRight.rotation.z, 0, IDLE_LERP_FACTOR);
+                    legLeft.rotation.y = THREE.MathUtils.lerp(legLeft.rotation.y, 0, IDLE_LERP_FACTOR);
+                    legRight.rotation.y = THREE.MathUtils.lerp(legRight.rotation.y, 0, IDLE_LERP_FACTOR);
+                    
+                    // Reset Body Lean/Squat X-rotation
+                    lowerBodyGroup.rotation.x = THREE.MathUtils.lerp(lowerBodyGroup.rotation.x, 0, IDLE_LERP_FACTOR);
+                    middleBodyGroup.rotation.x = THREE.MathUtils.lerp(middleBodyGroup.rotation.x, 0, IDLE_LERP_FACTOR);
+                    upperBodyGroup.rotation.x = THREE.MathUtils.lerp(upperBodyGroup.rotation.x, 0, IDLE_LERP_FACTOR);
+                    
+                    // Reset Z-rotation
+                    lowerBodyGroup.rotation.z = THREE.MathUtils.lerp(lowerBodyGroup.rotation.z, 0, IDLE_LERP_FACTOR);
+                }
+            }
+            
+            // Update spine and arms
+            updateSpineLookAt();
+            updateArmLookAt(effectiveTotalMovement > 0.0001, isCurrentlyAirborne);
+        }
+
+        // ---------- VÒNG LẶP HOẠT ẢNH CHÍNH (Giữ nguyên) ----------
+        function animate() {
+            requestAnimationFrame(animate);
+
+            handleInput();
+            updateCameraPosition();
+            
+            renderer.render(scene, camera);
+        }
+        // --------------------------------------------------------
+
+        // ---------- Keyboard handlers (Giữ nguyên) ----------
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'w' || key === 'a' || key === 's' || key === 'd') keys[key] = true;
+            
+            // Xử lý nút Spacebar
+            if (e.code === 'Space' && !keys.Space && cube.position.y <= groundY + 0.01) {
+                keys.Space = true;
+                if (!isCharging) {
+                    jumpChargeStartTime = performance.now(); // Ghi lại thời điểm nhấn
+                }
+            }
+            
+            if (key === 'r') {
+                ragdollEnabled = !ragdollEnabled;
+                if (ragdollEnabled) { forearmVelLeft = 0; forearmVelRight = 0; } // Reset velocity on toggle
+                statusMessageElement.innerHTML = `Trạng thái: <strong>Ragdoll ${ragdollEnabled ? 'ĐÃ BẬT' : 'ĐÃ TẮT'}.</strong>`;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'w' || key === 'a' || key === 's' || key === 'd') keys[key] = false;
+            
+            // Xử lý khi Spacebar được nhả ra
+            if (e.code === 'Space') {
+                keys.Space = false; // Luôn đặt về false khi nhả phím
+                
+                // Chỉ xử lý nhảy nếu đang tiếp đất
+                if (cube.position.y <= groundY + 0.01) { 
+                    const chargeDuration = performance.now() - jumpChargeStartTime;
+                    
+                    if (isCharging) {
+                        // Kích hoạt nhảy tụ lực
+                        triggerChargedJump();
+                    } else if (chargeDuration < MIN_TAP_TIME_MS) {
+                        // Kích hoạt nhảy base (Tap) - chỉ khi đang di chuyển
+                        const isMovingOnGround = keys['w'] || keys['s'] || keys['a'] || keys['d'];
+                        
+                        if (isMovingOnGround) {
+                            verticalVelocity = BASE_JUMP_VELOCITY;
+                            statusMessageElement.innerHTML = `Trạng thái: <strong>NHẢY BASE (Tap).</strong>`;
+                            isJumpAnimating = true; // Bật hoạt ảnh Tap Jump
+                            
+                            // Đảo chân nhảy (để mỗi lần nhảy Base sẽ co chân khác nhau)
+                            activeJumpLeg = activeJumpLeg === 'LEFT' ? 'RIGHT' : 'LEFT'; 
+                        } else {
+                            // Tap khi đứng yên không làm gì cả (Chỉ cho phép Charge Stand)
+                            statusMessageElement.innerHTML = `Trạng thái: <strong>Chờ nạp lực.</strong>`;
+                        }
+                    }
+                }
+            }
+        });
+
+        // ---------- Resize (Giữ nguyên) ----------
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ---------- Start (Giữ nguyên) ----------
+        window.onload = function () {
+            init();
+            animate();
+        }
+
+    </script>
+</body>
+</html>
